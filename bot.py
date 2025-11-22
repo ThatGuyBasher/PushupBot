@@ -1,17 +1,144 @@
 import os
 import asyncio
 from datetime import datetime, date, timedelta, time, timezone
-# --- NEW: MongoDB Imports ---
-from pymongo import MongoClient
-from pymongo.errors import ConnectionFailure, OperationFailure
+# Replaced aiosqlite with replit.db for persistent storage
+from replit import db 
 import discord
 from discord.ext import commands, tasks
 from discord.ui import Modal, TextInput
-# --- REMOVED: from replit import db
-# --- REMOVED: from keep_alive import keep_alive 
+# Import the keep_alive function to prevent the Repl from sleeping
+from keep_alive import keep_alive 
+
+# ---------------------------------------------
+# ---- DATABASE OPERATIONS (REPLIT DB) ----
+# ---------------------------------------------
+
+def init_db():
+    """Initializes Replit DB keys if they don't exist."""
+    print("Initializing Replit DB...")
+
+    # Initialize individual message IDs for persistent messages
+    if "leaderboard_msg_id" not in db:
+        db["leaderboard_msg_id"] = 0
+    if "quick_log_msg_id" not in db:
+        db["quick_log_msg_id"] = 0
+    if "reminder_control_msg_id" not in db:
+        db["reminder_control_msg_id"] = 0
+
+    # Initialize the main user data store as an empty dictionary
+    # Key: User ID (str), Value: User Stats Dictionary
+    if "user_data" not in db:
+        db["user_data"] = {}
+    print("Replit DB initialization complete.")
+
+def _get_user_data(user_id):
+    """Internal function to safely retrieve user data."""
+    user_id_str = str(user_id)
+    user_data = db.get("user_data", {})
+    return user_data.get(user_id_str, None)
+
+def _set_user_data(user_id, data):
+    """Internal function to safely save user data."""
+    user_id_str = str(user_id)
+    user_data = db.get("user_data", {})
+    user_data[user_id_str] = data
+    db["user_data"] = user_data
+
+def get_user_stats(user_id):
+    """Retrieves all stats for a user."""
+    return _get_user_data(user_id)
+
+def get_all_users():
+    """Returns a list of all user dictionaries."""
+    return list(db.get("user_data", {}).values())
+
+def calculate_streak(user_stats):
+    """Calculates the current consecutive daily pushup streak based on logs."""
+    daily_logs = user_stats.get("daily_logs", {})
+    if not daily_logs:
+        return 0
+
+    # Convert all logged dates to datetime.date objects and sort them
+    # Filter for dates with > 0 reps
+    logged_dates = sorted([
+        datetime.strptime(d, "%Y-%m-%d").date() 
+        for d, reps in daily_logs.items() if reps > 0
+    ], reverse=True) # Sort newest to oldest
+
+    if not logged_dates:
+        return 0
+
+    today = datetime.now(TZ).date()
+    current_streak = 0
+
+    # Check if the most recent log is today or yesterday
+    most_recent_log = logged_dates[0]
+
+    if most_recent_log == today:
+        current_streak = 1
+        expected_date = today - timedelta(days=1)
+        # Start checking from the second most recent log
+        check_logs = logged_dates[1:]
+    elif most_recent_log == today - timedelta(days=1):
+        current_streak = 1
+        expected_date = today - timedelta(days=2)
+        # Start checking from the most recent log (yesterday)
+        check_logs = logged_dates
+    else:
+        # Most recent log is older than yesterday, streak is 0
+        return 0
+
+    # Iterate through past dates to extend the streak
+    for log_date in check_logs:
+        if log_date == expected_date:
+            current_streak += 1
+            expected_date -= timedelta(days=1)
+        # If the logged date is older than expected, the streak is broken
+        elif log_date < expected_date:
+            break
+
+    return current_streak
+
+
+def log_pushups(user_id, reps, log_date):
+    """Logs reps for a user on a given date and updates total."""
+    user_stats = _get_user_data(user_id)
+
+    # Initialize stats if user is new
+    if not user_stats:
+        user_stats = {
+            "user_id": user_id,
+            "total_pushups": 0,
+            "reminder_level": 0,
+            "daily_logs": {}, # Key: YYYY-MM-DD, Value: reps
+            "last_reminder_check": 0 # Unix timestamp of last reminder check
+        }
+
+    # Update total
+    user_stats["total_pushups"] += reps
+
+    # Update daily logs (stores logs in YYYY-MM-DD format within the user's data map)
+    date_str = log_date.strftime("%Y-%m-%d")
+    current_reps = user_stats["daily_logs"].get(date_str, 0)
+    user_stats["daily_logs"][date_str] = current_reps + reps
+
+    _set_user_data(user_id, user_stats)
+
+def update_user_stats(user_id, **kwargs):
+    """Updates user fields like reminder_level or last_reminder_check."""
+    user_stats = _get_user_data(user_id)
+    if user_stats:
+        for key, value in kwargs.items():
+            # Check if the key exists or is one we manage
+            if key in user_stats or key in ["total_pushups", "reminder_level", "daily_logs", "last_reminder_check"]: 
+                user_stats[key] = value
+        _set_user_data(user_id, user_stats)
+    # If user doesn't exist, we skip the update, which is fine for these fields.
+
 
 # ---- CONSTANTS & ENV ----
 # Load LEADERBOARD_CHANNEL ID from environment variable
+# The second argument (0) is a fallback if the environment variable is not set
 try:
     LEADERBOARD_CHANNEL = int(os.getenv("LEADERBOARD_CHANNEL"))
 except (TypeError, ValueError):
@@ -22,6 +149,7 @@ except (TypeError, ValueError):
 TZ = timezone.utc
 
 # Reminder Levels (in minutes from midnight UTC)
+# Key: Level, Value: Time object for the specific time
 REMINDER_SCHEDULE = {
     1: time(hour=9, minute=0, tzinfo=TZ),  # 09:00 UTC
     2: time(hour=12, minute=0, tzinfo=TZ), # 12:00 UTC
@@ -40,134 +168,41 @@ REMINDER_EMOJIS = {
 
 # Setup Intents
 intents = discord.Intents.default()
+# intents.message_content = True is not needed if only interacting with slash commands
 intents.message_content = False 
 intents.dm_messages = True # Required for sending direct reminders
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-
 # ---------------------------------------------
-# ---- MONGODB SETUP ----
+# ---- MESSAGE ID HANDLING (REPLIT DB) ----
 # ---------------------------------------------
-# Load the URI from the Render Environment variable
-MONGO_URI = os.getenv("MONGO_URI") 
-# Global collection references
-user_data_collection = None
-message_ids_collection = None 
-
-def setup_database():
-    """Initializes and verifies the MongoDB connection."""
-    global user_data_collection, message_ids_collection
-    if not MONGO_URI:
-        print("FATAL ERROR: MONGO_URI is missing. Cannot connect to database.")
-        return
-        
-    try:
-        mongo_client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        mongo_client.admin.command('ping') # Verify connection
-        
-        # Define the database and collections
-        mongo_db = mongo_client["PushupBotDB"] 
-        user_data_collection = mongo_db["UserData"] # For user stats and logs
-        message_ids_collection = mongo_db["MessageIDs"] # For persistent message IDs
-        
-        print("Successfully connected to MongoDB Atlas.")
-    except ConnectionFailure as e:
-        print(f"FATAL ERROR: MongoDB connection failed (Check Network Access): {e}")
-    except OperationFailure as e:
-        print(f"FATAL ERROR: MongoDB authentication failed (Check URI credentials): {e}")
-
-# Call this setup function immediately
-setup_database()
-
-
-# ---------------------------------------------
-# ---- DATABASE OPERATIONS (MONGODB) ----
-# ---------------------------------------------
-# Removed: def init_db():
-
-def _get_user_data(user_id):
-    """Internal function to safely retrieve user data."""
-    if user_data_collection is None:
-        return None # Fail gracefully if not connected
-        
-    # Finds the document where the _id field matches the user_id string
-    document = user_data_collection.find_one({"_id": str(user_id)})
-    
-    # Return the 'data' field, or None if the user document is not found
-    return document.get("data") if document else None
-
-def _set_user_data(user_id, data):
-    """Internal function to safely save user data."""
-    if user_data_collection is None:
-        return
-
-    # Update the existing document or insert a new one
-    user_data_collection.replace_one(
-        {"_id": str(user_id)}, # Filter: find the document by its _id
-        {"_id": str(user_id), "data": data}, # The document to insert/replace
-        upsert=True # Insert a new one if no matching document is found
-    )
-
-def get_user_stats(user_id):
-    """Retrieves all stats for a user."""
-    return _get_user_data(user_id)
-
-def get_all_users():
-    """Returns a list of all user dictionaries."""
-    if user_data_collection is None:
-        return []
-            
-    # Fetch all documents and extract the 'data' field from each
-    all_data = [doc.get("data") for doc in user_data_collection.find() if doc.get("data")]
-    return all_data
-
-# The rest of the functions (calculate_streak, log_pushups, update_user_stats)
-# remain the same as they call _get_user_data and _set_user_data, which are updated.
-
-# ---- MESSAGE ID HANDLING (MONGODB) ----
-def _get_msg_id_helper(key_name):
-    """Reads a stored message ID for a persistent message."""
-    if message_ids_collection is None:
-        return 0
-        
-    # Find the specific key by its unique name
-    document = message_ids_collection.find_one({"_id": key_name})
-    # Return the stored ID or 0 if not found
-    return document.get("message_id", 0) if document else 0
-
-def _set_msg_id_helper(key_name, message_id):
-    """Stores a message ID for a persistent message."""
-    if message_ids_collection is None:
-        return
-        
-    # Update or insert the document for the specific key
-    message_ids_collection.replace_one(
-        {"_id": key_name},
-        {"_id": key_name, "message_id": message_id},
-        upsert=True
-    )
 
 def get_leaderboard_msg_id():
-    return _get_msg_id_helper("leaderboard_msg_id")
+    """Reads the stored message ID for the leaderboard."""
+    return db.get("leaderboard_msg_id", 0)
 
 def set_leaderboard_msg_id(message_id):
-    _set_msg_id_helper("leaderboard_msg_id", message_id)
+    """Stores the message ID for the leaderboard."""
+    db["leaderboard_msg_id"] = message_id
 
 def get_quick_log_msg_id():
-    return _get_msg_id_helper("quick_log_msg_id")
+    """Reads the stored message ID for the quick log."""
+    return db.get("quick_log_msg_id", 0)
 
 def set_quick_log_msg_id(message_id):
-    _set_msg_id_helper("quick_log_msg_id", message_id)
+    """Stores the message ID for the quick log."""
+    db["quick_log_msg_id"] = message_id
 
 def get_reminder_control_msg_id():
-    return _get_msg_id_helper("reminder_control_msg_id")
+    """Reads the stored message ID for the reminder control panel."""
+    return db.get("reminder_control_msg_id", 0)
 
 def set_reminder_control_msg_id(message_id):
-    _set_msg_id_helper("reminder_control_msg_id", message_id)
-
+    """Stores the message ID for the reminder control panel."""
+    db["reminder_control_msg_id"] = message_id
 
 # ---------------------------------------------
-# ---- VIEW COMPONENTS (No change needed) ----
+# ---- VIEW COMPONENTS ----
 # ---------------------------------------------
 
 class RepsModal(Modal, title='Log Pushups'):
@@ -305,18 +340,22 @@ class ReminderToggleView(discord.ui.View):
         )
 
 # ---------------------------------------------
-# ---- PERSISTENT MESSAGE MANAGEMENT (Unchanged) ----
+# ---- PERSISTENT MESSAGE MANAGEMENT ----
 # ---------------------------------------------
 
 async def setup_reminder_control_message(bot_instance: commands.Bot):
     """Sends or edits the persistent message for reminder control."""
+
     # print(f"Setting up Reminder Control Message in Channel ID: {LEADERBOARD_CHANNEL}")
+
     channel = bot_instance.get_channel(LEADERBOARD_CHANNEL)
     if not channel:
         # print(f"Error: Reminder control channel ID {LEADERBOARD_CHANNEL} not found.")
         return
+
     msg_id = get_reminder_control_msg_id()
     view = ReminderToggleView()
+
     embed = discord.Embed(
         title="🔔 Daily Pushup Reminders",
         description=(
@@ -325,6 +364,7 @@ async def setup_reminder_control_message(bot_instance: commands.Bot):
         ),
         color=discord.Color.blue()
     )
+
     try:
         # Try to fetch and edit the existing message
         if msg_id != 0:
@@ -334,27 +374,37 @@ async def setup_reminder_control_message(bot_instance: commands.Bot):
         else:
             msg = await channel.send(embed=embed, view=view)
             set_reminder_control_msg_id(msg.id)
+
+        # print("Reminder control message updated successfully.")
+
     except discord.NotFound:
         # If the message was deleted, send a new one
+        # print("Reminder control message not found. Sending new one...")
         msg = await channel.send(embed=embed, view=view)
         set_reminder_control_msg_id(msg.id)
+
     except Exception as e:
         print(f"Failed to set up reminder control message: {e}")
 
 async def update_quick_log_message(bot_instance: commands.Bot):
     """Updates the persistent message with the quick log button."""
+
     # print(f"Setting up Quick Log Message in Channel ID: {LEADERBOARD_CHANNEL}")
+
     channel = bot_instance.get_channel(LEADERBOARD_CHANNEL)
     if not channel:
         # print(f"Error: Quick log channel ID {LEADERBOARD_CHANNEL} not found.")
         return
+
     msg_id = get_quick_log_msg_id()
     view = PushupQuickLogView()
+
     embed = discord.Embed(
         title="Quick Log Your Pushups 📝",
         description="Click the button below to quickly log your pushup reps for today!",
         color=discord.Color.green()
     )
+
     try:
         # Try to fetch and edit the existing message
         if msg_id != 0:
@@ -364,10 +414,15 @@ async def update_quick_log_message(bot_instance: commands.Bot):
         else:
             msg = await channel.send(embed=embed, view=view)
             set_quick_log_msg_id(msg.id)
+
+        # print("Quick log message updated successfully.")
+
     except discord.NotFound:
         # If the message was deleted, send a new one
+        # print("Quick log message not found. Sending new one...")
         msg = await channel.send(embed=embed, view=view)
         set_quick_log_msg_id(msg.id)
+
     except Exception as e:
         print(f"Failed to update quick log message: {e}")
 
@@ -377,6 +432,7 @@ def get_leaderboard_data(all_users, time_frame="all"):
     Returns a sorted list of tuples (user_stats, total_reps_for_frame).
     """
     now = datetime.now(TZ).date()
+
     if time_frame == "today":
         start_date = now
     elif time_frame == "week":
@@ -384,16 +440,20 @@ def get_leaderboard_data(all_users, time_frame="all"):
         start_date = now - timedelta(days=now.weekday())
     else: # "all"
         start_date = date.min # Effectively from the beginning
+
     leaderboard_totals = []
+
     for user_stats in all_users:
         total_reps = 0
         for date_str, reps in user_stats.get("daily_logs", {}).items():
             log_date = datetime.strptime(date_str, "%Y-%m-%d").date()
             if log_date >= start_date:
                 total_reps += reps
+
         # Only include users who logged reps in this period
         if total_reps > 0:
             leaderboard_totals.append((user_stats, total_reps))
+
     # Sort by total reps descending
     return sorted(leaderboard_totals, key=lambda x: x[1], reverse=True)
 
@@ -402,39 +462,53 @@ async def format_leaderboard(bot_instance, leaderboard_data):
     leaderboard_text = ""
     for i, (user_stats, total_reps) in enumerate(leaderboard_data[:10]): # Top 10
         user_id = user_stats["user_id"]
+
         # Fetch user object (try local cache first, then API)
         member = bot_instance.get_user(user_id) or await bot_instance.fetch_user(user_id)
+
         name = member.display_name if member else f"User ID: {user_id}"
+
         emoji = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"#{i+1}"
+
         # Calculate and display the streak only for All-Time or Current data
         current_streak = calculate_streak(user_stats)
         streak_text = f"🔥 {current_streak} days" if current_streak > 0 else ""
+
         # Format the line: Emoji Name: Reps Streak
         leaderboard_text += f"{emoji} **{name}**: {total_reps:,} reps {streak_text}\n"
+
     if not leaderboard_text:
         leaderboard_text = "No pushup logs yet! Be the first one to log some reps."
+
     return leaderboard_text
 
 async def update_leaderboard(bot_instance: commands.Bot):
     """Generates the leaderboard and sends/edits the persistent message."""
+
     # print(f"Updating Leaderboard in Channel ID: {LEADERBOARD_CHANNEL}")
+
     # 1. Get and process data for different timeframes
     all_users = get_all_users()
+
     # Calculate Leaderboard Data for each view
     all_time_data = get_leaderboard_data(all_users, "all")
     weekly_data = get_leaderboard_data(all_users, "week")
     daily_data = get_leaderboard_data(all_users, "today")
+
     # Format the data into strings
     all_time_text = await format_leaderboard(bot_instance, all_time_data)
     weekly_text = await format_leaderboard(bot_instance, weekly_data)
     daily_text = await format_leaderboard(bot_instance, daily_data)
+
     # 2. Create the embed
     current_time_str = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
     embed = discord.Embed(
         title="🏆 Pushup Challenge Leaderboards 🏆",
         description="Check out the top performers across different timeframes!",
         color=discord.Color.gold()
     )
+
     # Add fields for each leaderboard (Daily, Weekly, All-Time)
     embed.add_field(
         name="🗓️ Today's Top 10", 
@@ -451,13 +525,17 @@ async def update_leaderboard(bot_instance: commands.Bot):
         value=all_time_text, 
         inline=False
     )
+
     embed.set_footer(text=f"Last updated: {current_time_str} | Week starts Monday UTC")
+
     # 3. Find and update the message
     channel = bot_instance.get_channel(LEADERBOARD_CHANNEL)
     if not channel:
         # print(f"Error: Leaderboard channel ID {LEADERBOARD_CHANNEL} not found.")
         return
+
     msg_id = get_leaderboard_msg_id()
+
     try:
         if msg_id != 0:
             # Edit existing message
@@ -467,16 +545,21 @@ async def update_leaderboard(bot_instance: commands.Bot):
             # Send new message and store ID
             msg = await channel.send(embed=embed)
             set_leaderboard_msg_id(msg.id)
+
+        # print("Leaderboard updated successfully.")
+
     except discord.NotFound:
         # print("Leaderboard message not found. Sending new one...")
         msg = await channel.send(embed=embed)
         set_leaderboard_msg_id(msg.id)
+
     except Exception as e:
         print(f"Failed to update leaderboard: {e}")
 
 # ---------------------------------------------
-# ---- BACKGROUND TASKS & REMINDERS (Unchanged) ----
+# ---- BACKGROUND TASKS & REMINDERS ----
 # ---------------------------------------------
+
 @tasks.loop(minutes=30)
 async def persistent_message_task():
     """Task to periodically update the leaderboard and other persistent messages."""
@@ -487,10 +570,16 @@ async def persistent_message_task():
 async def send_reminders_for_level(level):
     """Checks all users and sends a reminder to those at the specified level."""
     current_timestamp = int(datetime.now(TZ).timestamp())
+
     # We allow a buffer for the last check to be up to 10 minutes ago
+    # This prevents sending a reminder multiple times if the task is run manually 
+    # and then the scheduled loop runs immediately after.
+    # 600 seconds = 10 minutes
     ten_minutes_ago = current_timestamp - 600
+
     # Get a fresh list of users
     all_users = get_all_users()
+
     for user_stats in all_users:
         user_id = user_stats["user_id"]
         reminder_level = user_stats["reminder_level"]
@@ -513,12 +602,15 @@ async def send_reminders_for_level(level):
                         "Don't break that streak—get pushing! "
                         "Use the quick log button in the server or the `/log` command."
                     )
+
                     # Send message
                     await user.send(message_content)
+
                     # Update last_reminder_check to prevent repeat DMs
                     update_user_stats(user_id, last_reminder_check=current_timestamp)
                 # else:
                 #     print(f"Skipping reminder for user {user_id}: logged {logged_today} today.")
+
             except discord.Forbidden:
                 print(f"Cannot send DM to user {user_id}. They may have DMs disabled.")
             except Exception as e:
@@ -554,7 +646,7 @@ async def before_reminder_tasks():
     await bot.wait_until_ready()
 
 # ---------------------------------------------
-# ---- COMMANDS (Unchanged) ----
+# ---- COMMANDS ----
 # ---------------------------------------------
 
 @bot.tree.command(name="log", description="Log pushups for a specific user and date (Admin/Manual).")
@@ -680,18 +772,40 @@ async def edit_reps_command(interaction: discord.Interaction, user: discord.Memb
         await interaction.response.send_message("An unexpected error occurred.", ephemeral=True)
 
 # ---------------------------------------------
-# ---- BOT EVENTS (Unchanged) ----
+# ---- BOT EVENTS ----
 # ---------------------------------------------
 
 async def check_for_missed_reminders(current_time: datetime):
-    # ... (function body remains the same)
-    pass # Function implementation removed for brevity
+    """
+    Checks if the bot missed any scheduled reminder times today due to a restart 
+    and manually triggers the corresponding reminder checks.
+    """
+    print("Checking for missed daily reminders due to restart...")
+
+    # Iterate through reminder levels from highest time (Level 4) to lowest (Level 1)
+    # This ensures we run the most specific checks first.
+    sorted_levels = sorted(REMINDER_SCHEDULE.keys(), reverse=True) 
+
+    for level in sorted_levels:
+        schedule_time = REMINDER_SCHEDULE[level]
+
+        # Create a datetime object for today at the scheduled time (in UTC)
+        scheduled_dt = datetime.combine(current_time.date(), schedule_time, tzinfo=TZ)
+
+        # Check if the scheduled time has passed TODAY and is before the current time
+        # We also check if the scheduled time is within the last 30 minutes 
+        # (This avoids running every single reminder check if the bot restarts late at night)
+        if scheduled_dt < current_time and (current_time - scheduled_dt) < timedelta(minutes=30):
+            print(f"  -> Missed reminder level {level} detected! Running check now.")
+            # Manually run the reminder function for this level
+            await send_reminders_for_level(level)
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
-    # Removed: init_db() call
+    # Initialize the database keys on start-up (synchronous function)
+    init_db() 
 
     # Sync commands globally 
     try:
@@ -727,8 +841,12 @@ async def on_ready():
         reminder_level_4.start()
 
 # ---------------------------------------------
-# ---- RUN BOT (Simplified for Render) ----
+# ---- RUN BOT ----
 # ---------------------------------------------
 
-# Run the bot using the token from the Render environment variables
-bot.run(os.getenv("DISCORD_BOT_TOKEN"))
+if __name__ == "__main__":
+    # Start the web server to prevent the Replit container from idling
+    keep_alive() 
+
+    # Run the bot using the token from Replit Secrets
+    bot.run(os.getenv("DISCORD_BOT_TOKEN"))
