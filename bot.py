@@ -68,7 +68,8 @@ def get_all_users():
 
 def update_user_stats(user_id, **kwargs):
     if USER_COLLECTION is None: return
-    update_data = {"$set": kwargs}
+    
+    # Initialize defaults if user doesn't exist
     on_insert_data = {
         "user_id": user_id,
         "total_pushups": 0,
@@ -107,6 +108,7 @@ def calculate_streak(user_stats):
     daily_logs = user_stats.get("daily_logs", {})
     if not daily_logs: return 0
 
+    # Sort logs by date (newest first)
     logged_dates = sorted([
         datetime.strptime(d, "%Y-%m-%d").date() 
         for d, reps in daily_logs.items() if reps > 0
@@ -146,19 +148,16 @@ except (TypeError, ValueError):
     print("WARNING: LEADERBOARD_CHANNEL environment variable is missing or invalid.")
     LEADERBOARD_CHANNEL = 0 
 
-# Note: Ensure this matches your desired timezone. 
-# If you are in EST/EDT, you may want to look into pytz library for accurate local times,
-# otherwise 11:30pm UTC will be late afternoon in the US.
+# Timezone (UTC)
 TZ = timezone.utc 
 
-# --- UPDATED REMINDER SCHEDULE ---
-# We now have 4 fixed stages. If a user has reminders ON, they get hit at these times
-# UNLESS they have already logged.
+# --- REMINDER SCHEDULE ---
+# 4 fixed stages. 
 REMINDER_SCHEDULE = {
     1: time(hour=9, minute=0, tzinfo=TZ),   # Stage 1: Morning
     2: time(hour=14, minute=0, tzinfo=TZ),  # Stage 2: Afternoon
     3: time(hour=20, minute=0, tzinfo=TZ),  # Stage 3: Evening
-    4: time(hour=23, minute=30, tzinfo=TZ), # Stage 4: The 11:30 PM Panic
+    4: time(hour=23, minute=30, tzinfo=TZ), # Stage 4: 11:30 PM Panic
 }
 
 # --- ESCALATING MESSAGES ---
@@ -238,9 +237,6 @@ class PushupQuickLogView(discord.ui.View):
         await interaction.response.send_modal(RepsModal()) 
 
 class ReminderToggleView(discord.ui.View):
-    """
-    Updated View: Simple On/Off logic.
-    """
     def __init__(self):
         super().__init__(timeout=None)
 
@@ -339,7 +335,10 @@ async def update_quick_log_message(bot_instance: commands.Bot):
     except Exception:
         pass
 
+# --- LEADERBOARD LOGIC ---
+
 def get_leaderboard_data(all_users, time_frame="all"):
+    """Calculates rep totals for specific time frames."""
     now = datetime.now(TZ).date()
     if time_frame == "today": start_date = now
     elif time_frame == "week": start_date = now - timedelta(days=now.weekday())
@@ -357,31 +356,68 @@ def get_leaderboard_data(all_users, time_frame="all"):
 
     return sorted(leaderboard_totals, key=lambda x: x[1], reverse=True)
 
+def get_streak_leaderboard_data(all_users):
+    """Calculates active streaks for all users and returns sorted list."""
+    streak_data = []
+    for user_stats in all_users:
+        streak = calculate_streak(user_stats)
+        if streak > 0:
+            streak_data.append((user_stats, streak))
+    
+    # Sort by streak length (descending)
+    return sorted(streak_data, key=lambda x: x[1], reverse=True)
+
 async def format_leaderboard(bot_instance, leaderboard_data):
-    leaderboard_text = ""
+    """Formats rep-based leaderboards."""
+    text = ""
     for i, (user_stats, total_reps) in enumerate(leaderboard_data[:10]):
         user_id = user_stats["user_id"]
         try:
             member = bot_instance.get_user(user_id) or await bot_instance.fetch_user(user_id)
-            name = member.display_name if member else f"User ID: {user_id}"
-        except: name = f"User ID: {user_id}"
+            name = member.display_name if member else f"ID: {user_id}"
+        except: name = f"ID: {user_id}"
         
         emoji = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"#{i+1}"
-        streak = calculate_streak(user_stats)
-        streak_text = f"🔥 {streak}" if streak > 0 else ""
-        leaderboard_text += f"{emoji} **{name}**: {total_reps:,} {streak_text}\n"
-    return leaderboard_text if leaderboard_text else "No logs yet!"
+        text += f"{emoji} **{name}**: {total_reps:,}\n"
+    return text if text else "No logs yet!"
+
+async def format_streak_leaderboard(bot_instance, streak_data):
+    """Formats the specific streak leaderboard."""
+    text = ""
+    for i, (user_stats, streak) in enumerate(streak_data[:10]):
+        user_id = user_stats["user_id"]
+        try:
+            member = bot_instance.get_user(user_id) or await bot_instance.fetch_user(user_id)
+            name = member.display_name if member else f"ID: {user_id}"
+        except: name = f"ID: {user_id}"
+        
+        emoji = "👑" if i == 0 else "🔥" 
+        text += f"{emoji} **{name}**: {streak} days\n"
+    return text if text else "No active streaks!"
 
 async def update_leaderboard(bot_instance: commands.Bot):
     if MONGO_CLIENT is None: return
     all_users = get_all_users()
     
+    # Get Data
+    daily_data = get_leaderboard_data(all_users, "today")
+    weekly_data = get_leaderboard_data(all_users, "week")
+    all_time_data = get_leaderboard_data(all_users, "all")
+    streak_data = get_streak_leaderboard_data(all_users)
+
+    # Create Embed
     embed = discord.Embed(title="🏆 Pushup Leaderboards", color=discord.Color.gold())
-    embed.add_field(name="🗓️ Today", value=await format_leaderboard(bot_instance, get_leaderboard_data(all_users, "today")), inline=False)
-    embed.add_field(name="📅 This Week", value=await format_leaderboard(bot_instance, get_leaderboard_data(all_users, "week")), inline=False)
-    embed.add_field(name="👑 All-Time", value=await format_leaderboard(bot_instance, get_leaderboard_data(all_users, "all")), inline=False)
+    
+    # Add Streak Field (Placed first for motivation)
+    embed.add_field(name="🔥 Longest Active Streaks", value=await format_streak_leaderboard(bot_instance, streak_data), inline=False)
+    
+    embed.add_field(name="🗓️ Today's Reps", value=await format_leaderboard(bot_instance, daily_data), inline=False)
+    embed.add_field(name="📅 This Week's Reps", value=await format_leaderboard(bot_instance, weekly_data), inline=False)
+    embed.add_field(name="💪 All-Time Reps", value=await format_leaderboard(bot_instance, all_time_data), inline=False)
+    
     embed.set_footer(text=f"Updated: {datetime.now(TZ).strftime('%H:%M UTC')}")
 
+    # Send/Edit Message
     channel = bot_instance.get_channel(LEADERBOARD_CHANNEL)
     if not channel: return
     msg_id = get_leaderboard_msg_id()
@@ -411,7 +447,6 @@ async def persistent_message_task():
 async def send_reminders_at_stage(stage_level):
     """
     Sends reminders to users who have reminders enabled AND haven't logged yet today.
-    stage_level corresponds to the urgency (1=Morning, 4=Final 11:30pm).
     """
     if MONGO_CLIENT is None: return
 
@@ -424,30 +459,25 @@ async def send_reminders_at_stage(stage_level):
     for user_stats in all_users:
         user_id = user_stats["user_id"]
         
-        # Check if user has reminders Enabled (reminder_level 1 means ON now)
+        # Check if user has reminders Enabled (level 1 = ON)
         is_enabled = user_stats.get("reminder_level", 0) == 1
         last_reminder_check = user_stats.get("last_reminder_check", 0)
 
-        # If reminders are OFF, skip
-        if not is_enabled:
-            continue
+        if not is_enabled: continue
 
         # Check if they have logged today
         today_str = datetime.now(TZ).strftime("%Y-%m-%d")
         logged_today = user_stats.get("daily_logs", {}).get(today_str, 0)
 
-        # IF: Reminders are ON, AND they haven't logged, AND we haven't spammed them in last 10 mins
+        # IF: Reminders ON, Not Logged, Not recently messaged
         if logged_today == 0 and last_reminder_check < ten_minutes_ago:
             try:
                 user = bot.get_user(user_id) or await bot.fetch_user(user_id)
-                
-                # Get the specific urgent message
                 msg_content = URGENCY_MESSAGES.get(stage_level, "Reminder: Do your pushups!")
                 
                 await user.send(msg_content)
                 print(f"Sent Stage {stage_level} reminder to {user.display_name}")
 
-                # Update last check so we don't double send if script restarts quickly
                 update_user_stats(user_id, last_reminder_check=current_timestamp)
 
             except discord.Forbidden:
@@ -466,7 +496,7 @@ async def reminder_stage_2(): await send_reminders_at_stage(2)
 async def reminder_stage_3(): await send_reminders_at_stage(3)
 
 @tasks.loop(time=REMINDER_SCHEDULE[4])
-async def reminder_stage_4(): await send_reminders_at_stage(4) # The 11:30 PM one
+async def reminder_stage_4(): await send_reminders_at_stage(4) 
 
 @persistent_message_task.before_loop
 async def before_persistent_message_task(): await bot.wait_until_ready()
@@ -503,20 +533,49 @@ async def stats_command(interaction: discord.Interaction):
 @bot.tree.command(name="editreps", description="Adjust reps for a user/date (Admin).")
 @commands.has_permissions(administrator=True)
 async def edit_reps_command(interaction: discord.Interaction, user: discord.Member, delta_reps: int, log_date: str):
+    """
+    Detailed version: Shows new totals after editing.
+    """
     try:
         date_obj = datetime.strptime(log_date, "%Y-%m-%d").date()
         date_str = date_obj.strftime("%Y-%m-%d")
         
+        # 1. Update the database
         USER_COLLECTION.update_one(
             {"user_id": user.id},
             {"$inc": {"total_pushups": delta_reps, f"daily_logs.{date_str}": delta_reps},
              "$setOnInsert": {"user_id": user.id, "reminder_level": 0, "last_reminder_check": 0}},
             upsert=True
         )
-        await interaction.response.send_message(f"✏️ Adjusted **{user.display_name}** logs by {delta_reps}.")
+
+        # 2. Fetch new stats to show the user
+        user_stats = get_user_stats(user.id)
+        # Check if user_stats is None (unlikely after upsert, but safe to check)
+        if not user_stats:
+             await interaction.response.send_message("Error fetching updated stats.", ephemeral=True)
+             return
+             
+        new_total = user_stats.get("total_pushups", 0)
+        new_daily = user_stats.get("daily_logs", {}).get(date_str, 0)
+        new_streak = calculate_streak(user_stats)
+
+        await interaction.response.send_message(
+            f"✏️ **Adjustment Successful** for {user.display_name} on {log_date}:\n"
+            f"• Change: {delta_reps:+}\n"
+            f"• New Daily: {new_daily}\n"
+            f"• New Total: {new_total:,}\n"
+            f"• Current Streak: {new_streak} days"
+        )
+        
+        # 3. Update the leaderboard
         await update_leaderboard(bot)
+
     except ValueError:
         await interaction.response.send_message("Invalid date. Use YYYY-MM-DD.", ephemeral=True)
+    except Exception as e:
+        print(f"Error in editreps: {e}")
+        await interaction.response.send_message("An unexpected error occurred.", ephemeral=True)
+
 
 # ---------------------------------------------
 # ---- BOT EVENTS ----
