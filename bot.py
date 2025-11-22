@@ -765,4 +765,14 @@ async def edit_reps_command(interaction: discord.Interaction, user: discord.Memb
 
 async def check_for_missed_reminders(current_time: datetime):
     """
-    Checks if the bot missed any scheduled reminder times today due to a
+    Checks if the bot missed any scheduled reminder times today due to a restart.
+    """
+    print("Checking for missed daily reminders due to restart...")
+
+    if MONGO_CLIENT is None: return
+
+    sorted_levels = sorted(REMINDER_SCHEDULE.keys(), reverse=True) 
+
+    for level in sorted_levels:
+        schedule_time = REMINDER_SCHEDULE[level]
+        scheduled_dt = datetime.combine(current_time.date(), schedule_time
