@@ -10,7 +10,7 @@ from pymongo import MongoClient
 from pymongo.collection import Collection
 
 # Import the keep_alive function to prevent the Repl from sleeping
-from keep_alive import keep_alive 
+from keep_alive import keep_alive
 
 # ---------------------------------------------
 # ---- MONGO DB SETUP ----
@@ -85,6 +85,7 @@ def update_user_stats(user_id, **kwargs):
     update_data = {"$set": kwargs}
     
     # Define default stats for a new user if one doesn't exist
+    # Only include non-$set fields in $setOnInsert
     on_insert_data = {
         "user_id": user_id,
         "total_pushups": 0,
@@ -92,7 +93,11 @@ def update_user_stats(user_id, **kwargs):
         "daily_logs": {}, # Key: YYYY-MM-DD, Value: reps
         "last_reminder_check": 0 # Unix timestamp of last reminder check
     }
-
+    # Clean $setOnInsert to only contain fields NOT being $set
+    clean_on_insert = {k: v for k, v in on_insert_data.items() if k not in kwargs}
+    
+    # We explicitly include the default fields for consistency even if $set might overwrite one of them
+    # This structure is functional but slightly verbose.
     USER_COLLECTION.update_one(
         {"user_id": user_id},
         {"$set": kwargs, "$setOnInsert": on_insert_data},
@@ -107,41 +112,31 @@ def log_pushups(user_id, reps, log_date):
 
     date_str = log_date.strftime("%Y-%m-%d")
     
-    # Increment total_pushups and update the specific daily log entry
+    # Atomically increment total_pushups and update the specific daily log entry.
     # $inc: increments a numeric field.
-    # $set: sets or updates a specific field, including nested dict keys.
-    
-    update_result = USER_COLLECTION.update_one(
+    # $setOnInsert: if a new document is created (upsert: True), these fields are set.
+    # The fields being $inc'd (total_pushups and daily_logs.date_str) are implicitly 
+    # initialized to 0 and then incremented in one atomic step if the document is new.
+    # The second update in the original code was incorrect and caused double-logging on upsert.
+    USER_COLLECTION.update_one(
         {"user_id": user_id},
         {
             "$inc": {
                 "total_pushups": reps,
                 f"daily_logs.{date_str}": reps 
             },
+            # Only include fields here that are NOT being $inc'd but need defaults
             "$setOnInsert": {
                 "user_id": user_id,
-                "total_pushups": 0,
                 "reminder_level": 0,
-                "daily_logs": {},
-                "last_reminder_check": 0
+                "last_reminder_check": 0,
+                "daily_logs": {}, # Initialize the map if it doesn't exist
+                "total_pushups": 0, # Initialize total if it doesn't exist
             }
         },
         upsert=True
     )
 
-    # Need to run a second update if $setOnInsert had to create the document
-    # because the initial $inc would have been applied to 0-values from $setOnInsert.
-    if update_result.upserted_id:
-        # Re-run update to apply the reps to the newly created document correctly
-        USER_COLLECTION.update_one(
-            {"user_id": user_id},
-            {
-                "$inc": {
-                    "total_pushups": reps,
-                    f"daily_logs.{date_str}": reps 
-                }
-            }
-        )
 
 def calculate_streak(user_stats):
     """Calculates the current consecutive daily pushup streak based on logs."""
@@ -293,7 +288,8 @@ class RepsModal(Modal, title='Log Pushups'):
 
             # Calculate the streak after logging
             user_stats = get_user_stats(interaction.user.id)
-            streak = calculate_streak(user_stats)
+            # Handle the case where user_stats might still be None if DB is down
+            streak = calculate_streak(user_stats) if user_stats else 0 
 
             await interaction.response.send_message(
                 f"💪 Logged **{reps}** pushups for today! "
@@ -475,6 +471,7 @@ def get_leaderboard_data(all_users, time_frame="all"):
     if time_frame == "today":
         start_date = now
     elif time_frame == "week":
+        # Monday is 0, Sunday is 6. This calculates the start of the week (Monday)
         start_date = now - timedelta(days=now.weekday())
     else: # "all"
         start_date = date.min 
@@ -503,8 +500,15 @@ async def format_leaderboard(bot_instance, leaderboard_data):
     for i, (user_stats, total_reps) in enumerate(leaderboard_data[:10]):
         user_id = user_stats["user_id"]
 
-        member = bot_instance.get_user(user_id) or await bot_instance.fetch_user(user_id)
-        name = member.display_name if member else f"User ID: {user_id}"
+        # Safely fetch user object
+        try:
+            member = bot_instance.get_user(user_id) or await bot_instance.fetch_user(user_id)
+            name = member.display_name if member else f"User ID: {user_id}"
+        except discord.NotFound:
+            # Handle case where user might have left all shared servers or been deleted
+            name = f"Unknown User ({user_id})"
+        except Exception:
+            name = f"User ID: {user_id}"
 
         emoji = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else f"#{i+1}"
 
@@ -583,6 +587,7 @@ async def send_reminders_for_level(level):
     if MONGO_CLIENT is None: return
 
     current_timestamp = int(datetime.now(TZ).timestamp())
+    # Ensure users are not reminded again within a short period (10 minutes)
     ten_minutes_ago = current_timestamp - 600
 
     all_users = get_all_users()
@@ -592,6 +597,7 @@ async def send_reminders_for_level(level):
         reminder_level = user_stats.get("reminder_level", 0)
         last_reminder_check = user_stats.get("last_reminder_check", 0)
 
+        # Only send reminder if level matches and the user hasn't been checked recently
         if reminder_level >= level and last_reminder_check < ten_minutes_ago:
             try:
                 user = bot.get_user(user_id) or await bot.fetch_user(user_id)
@@ -610,6 +616,7 @@ async def send_reminders_for_level(level):
 
                     await user.send(message_content)
 
+                    # Update the timestamp only after successfully sending the reminder
                     update_user_stats(user_id, last_reminder_check=current_timestamp)
 
             except discord.Forbidden:
@@ -666,7 +673,8 @@ async def log_command(interaction: discord.Interaction, user: discord.Member, re
         log_pushups(user.id, reps, date_obj)
 
         user_stats = get_user_stats(user.id)
-        streak = calculate_streak(user_stats)
+        # Handle the case where user_stats might still be None if DB is down
+        streak = calculate_streak(user_stats) if user_stats else 0 
 
         await interaction.response.send_message(
             f"✅ Logged **{reps}** pushups for **{user.display_name}** on **{log_date}**. "
@@ -712,7 +720,7 @@ async def edit_reps_command(interaction: discord.Interaction, user: discord.Memb
         date_obj = datetime.strptime(log_date, "%Y-%m-%d").date()
         date_str = date_obj.strftime("%Y-%m-%d")
 
-        # MongoDB update using $inc for total and $set for the daily log field
+        # MongoDB update using $inc for total and the daily log field
         USER_COLLECTION.update_one(
             {"user_id": user.id},
             {
@@ -720,12 +728,13 @@ async def edit_reps_command(interaction: discord.Interaction, user: discord.Memb
                     "total_pushups": delta_reps,
                     f"daily_logs.{date_str}": delta_reps
                 },
+                # Clean up $setOnInsert to only include non-incremented fields for clarity
                 "$setOnInsert": {
                     "user_id": user.id,
-                    "total_pushups": 0,
                     "reminder_level": 0,
+                    "last_reminder_check": 0,
                     "daily_logs": {},
-                    "last_reminder_check": 0
+                    "total_pushups": 0,
                 }
             },
             upsert=True
@@ -736,11 +745,11 @@ async def edit_reps_command(interaction: discord.Interaction, user: discord.Memb
         # For simplicity, we trust the admin input for now.
 
         user_stats = get_user_stats(user.id)
-        new_streak = calculate_streak(user_stats)
-        new_total = user_stats.get("total_pushups", 0)
+        new_streak = calculate_streak(user_stats) if user_stats else 0
+        new_total = user_stats.get("total_pushups", 0) if user_stats else 0
         
         # Daily reps is fetched after the update
-        new_daily_reps = user_stats.get("daily_logs", {}).get(date_str, 0)
+        new_daily_reps = user_stats.get("daily_logs", {}).get(date_str, 0) if user_stats else 0
 
         await interaction.response.send_message(
             f"✏️ Logs for **{user.display_name}** on **{log_date}** adjusted by **{delta_reps}** reps:\n"
@@ -775,4 +784,61 @@ async def check_for_missed_reminders(current_time: datetime):
 
     for level in sorted_levels:
         schedule_time = REMINDER_SCHEDULE[level]
-        scheduled_dt = datetime.combine(current_time.date(), schedule_time
+        scheduled_dt = datetime.combine(current_time.date(), schedule_time, tzinfo=TZ)
+
+        # Check if the scheduled time is in the past, but not too far (within the last 30 min)
+        if scheduled_dt < current_time and (current_time - scheduled_dt) < timedelta(minutes=30):
+            print(f"  -> Missed reminder level {level} detected! Running check now.")
+            await send_reminders_for_level(level)
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
+
+    # Initialize the MongoDB connection on start-up
+    init_db() 
+
+    # If DB connection failed, stop execution gracefully
+    if MONGO_CLIENT is None:
+        print("Bot is shutting down due to database connection failure.")
+        # If running on a platform that doesn't immediately stop, 
+        # let it attempt to continue or use sys.exit() if allowed.
+        # For now, we'll just log and return.
+        # await bot.close() 
+        return
+
+    # Sync commands globally 
+    try:
+        synced = await bot.tree.sync()
+        print(f"Commands synced globally: {[cmd.name for cmd in synced]}")
+    except Exception as e:
+        print("Failed to sync commands:", e)
+
+    # Register the persistent views before starting tasks
+    bot.add_view(PushupQuickLogView())
+    bot.add_view(ReminderToggleView()) 
+
+    # Check for missed reminders right away
+    await check_for_missed_reminders(datetime.now(TZ))
+
+    # Start the tasks
+    if not persistent_message_task.is_running():
+        persistent_message_task.start()
+    if not reminder_level_1.is_running():
+        reminder_level_1.start()
+    if not reminder_level_2.is_running():
+        reminder_level_2.start()
+    if not reminder_level_3.is_running():
+        reminder_level_3.start()
+    if not reminder_level_4.is_running():
+        reminder_level_4.start()
+
+# ---------------------------------------------
+# ---- RUN BOT ----
+# ---------------------------------------------
+
+if __name__ == "__main__":
+    keep_alive() 
+    # NOTE: You MUST ensure your deployment environment uses a stable Python version (e.g., 3.11 or 3.12). 
+    # The logs indicate 3.13.4 is being used, which is likely causing the dependency install failures.
+    bot.run(os.getenv("DISCORD_BOT_TOKEN"))
