@@ -100,7 +100,7 @@ def update_user_stats(user_id, **kwargs):
     # This structure is functional but slightly verbose.
     USER_COLLECTION.update_one(
         {"user_id": user_id},
-        {"$set": kwargs, "$setOnInsert": on_insert_data},
+        {"$set": kwargs, "$setOnInsert": clean_on_insert},
         upsert=True
     )
 
@@ -842,3 +842,4 @@ if __name__ == "__main__":
     # NOTE: You MUST ensure your deployment environment uses a stable Python version (e.g., 3.11 or 3.12). 
     # The logs indicate 3.13.4 is being used, which is likely causing the dependency install failures.
     bot.run(os.getenv("DISCORD_BOT_TOKEN"))
+
