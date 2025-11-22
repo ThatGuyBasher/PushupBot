@@ -1,3 +1,8 @@
+print("=" * 50)
+print("BOT SCRIPT LOADING...")
+print("=" * 50)
+
+
 import os
 import asyncio
 from datetime import datetime, date, timedelta, time, timezone
@@ -793,6 +798,9 @@ async def check_for_missed_reminders(current_time: datetime):
 
 @bot.event
 async def on_ready():
+    print("=" * 50)
+    print("ON_READY EVENT TRIGGERED!")
+    print("=" * 50)
     print(f"Logged in as {bot.user} (ID: {bot.user.id})")
 
     # Initialize the MongoDB connection on start-up
@@ -836,10 +844,14 @@ async def on_ready():
 # ---------------------------------------------
 # ---- RUN BOT ----
 # ---------------------------------------------
+print("=" * 50)
+print("ABOUT TO START BOT...")
+print("=" * 50)
 
 if __name__ == "__main__":
     keep_alive() 
     # NOTE: You MUST ensure your deployment environment uses a stable Python version (e.g., 3.11 or 3.12). 
     # The logs indicate 3.13.4 is being used, which is likely causing the dependency install failures.
     bot.run(os.getenv("DISCORD_BOT_TOKEN"))
+
 
