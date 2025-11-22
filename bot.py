@@ -117,12 +117,6 @@ def log_pushups(user_id, reps, log_date):
 
     date_str = log_date.strftime("%Y-%m-%d")
     
-    # Atomically increment total_pushups and update the specific daily log entry.
-    # $inc: increments a numeric field.
-    # $setOnInsert: if a new document is created (upsert: True), these fields are set.
-    # The fields being $inc'd (total_pushups and daily_logs.date_str) are implicitly 
-    # initialized to 0 and then incremented in one atomic step if the document is new.
-    # The second update in the original code was incorrect and caused double-logging on upsert.
     USER_COLLECTION.update_one(
         {"user_id": user_id},
         {
@@ -130,13 +124,10 @@ def log_pushups(user_id, reps, log_date):
                 "total_pushups": reps,
                 f"daily_logs.{date_str}": reps 
             },
-            # Only include fields here that are NOT being $inc'd but need defaults
             "$setOnInsert": {
                 "user_id": user_id,
                 "reminder_level": 0,
                 "last_reminder_check": 0,
-                "daily_logs": {}, # Initialize the map if it doesn't exist
-                "total_pushups": 0, # Initialize total if it doesn't exist
             }
         },
         upsert=True
@@ -727,23 +718,20 @@ async def edit_reps_command(interaction: discord.Interaction, user: discord.Memb
 
         # MongoDB update using $inc for total and the daily log field
         USER_COLLECTION.update_one(
-            {"user_id": user.id},
-            {
-                "$inc": {
-                    "total_pushups": delta_reps,
-                    f"daily_logs.{date_str}": delta_reps
-                },
-                # Clean up $setOnInsert to only include non-incremented fields for clarity
-                "$setOnInsert": {
-                    "user_id": user.id,
-                    "reminder_level": 0,
-                    "last_reminder_check": 0,
-                    "daily_logs": {},
-                    "total_pushups": 0,
-                }
-            },
-            upsert=True
-        )
+    {"user_id": user.id},
+    {
+        "$inc": {
+            "total_pushups": delta_reps,
+            f"daily_logs.{date_str}": delta_reps
+        },
+        "$setOnInsert": {
+            "user_id": user.id,
+            "reminder_level": 0,
+            "last_reminder_check": 0,
+        }
+    },
+    upsert=True
+)
         
         # NOTE: Handling negative totals and ensuring daily reps >= 0 is more complex
         # with MongoDB's $inc and often requires application-level logic/transactions.
@@ -853,5 +841,6 @@ if __name__ == "__main__":
     # NOTE: You MUST ensure your deployment environment uses a stable Python version (e.g., 3.11 or 3.12). 
     # The logs indicate 3.13.4 is being used, which is likely causing the dependency install failures.
     bot.run(os.getenv("DISCORD_BOT_TOKEN"))
+
 
 
