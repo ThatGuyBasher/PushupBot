@@ -64,20 +64,20 @@ def init_db():
 
 def get_user_stats(user_id):
     """Retrieves all stats for a user."""
-    if not USER_COLLECTION:
+    if USER_COLLECTION is None:
         return None
     return USER_COLLECTION.find_one({"user_id": user_id})
 
 def get_all_users():
     """Returns a list of all user dictionaries."""
-    if not USER_COLLECTION:
+    if USER_COLLECTION is None:
         return []
     # Fetch all documents and convert cursor to list
     return list(USER_COLLECTION.find({}))
 
 def update_user_stats(user_id, **kwargs):
     """Updates user fields like reminder_level or last_reminder_check."""
-    if not USER_COLLECTION:
+    if USER_COLLECTION is None:
         return
 
     # Use $set to update specific fields, and $setOnInsert to initialize new user data
@@ -102,7 +102,7 @@ def update_user_stats(user_id, **kwargs):
 # --- MongoDB specific log_pushups (handles daily/total update atomically) ---
 def log_pushups(user_id, reps, log_date):
     """Logs reps for a user on a given date and updates total."""
-    if not USER_COLLECTION:
+    if USER_COLLECTION is None:
         return
 
     date_str = log_date.strftime("%Y-%m-%d")
@@ -233,14 +233,14 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 def _get_setting(key):
     """Safely retrieves a single setting value (like a message ID)."""
-    if not SETTINGS_COLLECTION:
+    if SETTINGS_COLLECTION is None:
         return 0
     settings = SETTINGS_COLLECTION.find_one({"_id": "message_ids"})
     return settings.get(key, 0) if settings else 0
 
 def _set_setting(key, value):
     """Safely sets a single setting value (like a message ID)."""
-    if not SETTINGS_COLLECTION:
+    if SETTINGS_COLLECTION is None:
         return
     SETTINGS_COLLECTION.update_one(
         {"_id": "message_ids"},
@@ -521,7 +521,7 @@ async def format_leaderboard(bot_instance, leaderboard_data):
 async def update_leaderboard(bot_instance: commands.Bot):
     """Generates the leaderboard and sends/edits the persistent message."""
     
-    if not MONGO_CLIENT: return
+    if MONGO_CLIENT is None: return
 
     all_users = get_all_users()
 
@@ -580,7 +580,7 @@ async def persistent_message_task():
 
 async def send_reminders_for_level(level):
     """Checks all users and sends a reminder to those at the specified level."""
-    if not MONGO_CLIENT: return
+    if MONGO_CLIENT is None: return
 
     current_timestamp = int(datetime.now(TZ).timestamp())
     ten_minutes_ago = current_timestamp - 600
@@ -704,7 +704,7 @@ async def edit_reps_command(interaction: discord.Interaction, user: discord.Memb
     """
     Adjusts the total number of pushups for a user on a specific day by a delta amount. 
     """
-    if not USER_COLLECTION:
+    if USER_COLLECTION is None:
         await interaction.response.send_message("Database not connected.", ephemeral=True)
         return
 
@@ -765,64 +765,4 @@ async def edit_reps_command(interaction: discord.Interaction, user: discord.Memb
 
 async def check_for_missed_reminders(current_time: datetime):
     """
-    Checks if the bot missed any scheduled reminder times today due to a restart.
-    """
-    print("Checking for missed daily reminders due to restart...")
-
-    if not MONGO_CLIENT: return
-
-    sorted_levels = sorted(REMINDER_SCHEDULE.keys(), reverse=True) 
-
-    for level in sorted_levels:
-        schedule_time = REMINDER_SCHEDULE[level]
-        scheduled_dt = datetime.combine(current_time.date(), schedule_time, tzinfo=TZ)
-
-        if scheduled_dt < current_time and (current_time - scheduled_dt) < timedelta(minutes=30):
-            print(f"  -> Missed reminder level {level} detected! Running check now.")
-            await send_reminders_for_level(level)
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-
-    # Initialize the MongoDB connection on start-up
-    init_db() 
-
-    # If DB connection failed, stop execution gracefully
-    if not MONGO_CLIENT:
-        print("Bot is shutting down due to database connection failure.")
-        await bot.close()
-        return
-
-    # Sync commands globally 
-    try:
-        synced = await bot.tree.sync()
-        print(f"Commands synced globally: {[cmd.name for cmd in synced]}")
-    except Exception as e:
-        print("Failed to sync commands:", e)
-
-    # Register the persistent views before starting tasks
-    bot.add_view(PushupQuickLogView())
-    bot.add_view(ReminderToggleView()) 
-
-    await check_for_missed_reminders(datetime.now(TZ))
-
-    # Start the tasks
-    if not persistent_message_task.is_running():
-        persistent_message_task.start()
-    if not reminder_level_1.is_running():
-        reminder_level_1.start()
-    if not reminder_level_2.is_running():
-        reminder_level_2.start()
-    if not reminder_level_3.is_running():
-        reminder_level_3.start()
-    if not reminder_level_4.is_running():
-        reminder_level_4.start()
-
-# ---------------------------------------------
-# ---- RUN BOT ----
-# ---------------------------------------------
-
-if __name__ == "__main__":
-    keep_alive() 
-    bot.run(os.getenv("DISCORD_BOT_TOKEN"))
+    Checks if the bot missed any scheduled reminder times today due to a
