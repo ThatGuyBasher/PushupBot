@@ -13,6 +13,9 @@ from discord.ui import Modal, TextInput
 from pymongo import MongoClient
 from pymongo.collection import Collection
 
+# --- NEW TIMEZONE IMPORT ---
+import pytz
+
 # Import the keep_alive function to prevent the Repl from sleeping
 from keep_alive import keep_alive
 
@@ -148,16 +151,17 @@ except (TypeError, ValueError):
     print("WARNING: LEADERBOARD_CHANNEL environment variable is missing or invalid.")
     LEADERBOARD_CHANNEL = 0 
 
-# Timezone (UTC)
-TZ = timezone.utc 
+# --- TIMEZONE SETTING (UPDATED TO EST/EDT) ---
+# 'America/New_York' handles both EST and EDT automatically
+TZ = pytz.timezone('America/New_York')
 
 # --- REMINDER SCHEDULE ---
 # 4 fixed stages. 
 REMINDER_SCHEDULE = {
-    1: time(hour=9, minute=0, tzinfo=TZ),   # Stage 1: Morning
-    2: time(hour=14, minute=0, tzinfo=TZ),  # Stage 2: Afternoon
-    3: time(hour=20, minute=0, tzinfo=TZ),  # Stage 3: Evening
-    4: time(hour=23, minute=30, tzinfo=TZ), # Stage 4: 11:30 PM Panic
+    1: time(hour=9, minute=0, tzinfo=TZ),   # Stage 1: Morning (9 AM EST)
+    2: time(hour=14, minute=0, tzinfo=TZ),  # Stage 2: Afternoon (2 PM EST)
+    3: time(hour=20, minute=0, tzinfo=TZ),  # Stage 3: Evening (8 PM EST)
+    4: time(hour=23, minute=30, tzinfo=TZ), # Stage 4: 11:30 PM Panic (EST)
 }
 
 # --- ESCALATING MESSAGES ---
@@ -292,7 +296,7 @@ async def setup_reminder_control_message(bot_instance: commands.Bot):
         description=(
             "Turn reminders **On** to receive motivation throughout the day.\n"
             "Reminders stop automatically for the day once you log your reps!\n\n"
-            "**Schedule:**\n"
+            "**Schedule (Eastern Time):**\n"
             "1. Morning Nudge\n"
             "2. Afternoon Check-in\n"
             "3. Evening Urgent\n"
@@ -415,7 +419,7 @@ async def update_leaderboard(bot_instance: commands.Bot):
     embed.add_field(name="📅 This Week's Reps", value=await format_leaderboard(bot_instance, weekly_data), inline=False)
     embed.add_field(name="💪 All-Time Reps", value=await format_leaderboard(bot_instance, all_time_data), inline=False)
     
-    embed.set_footer(text=f"Updated: {datetime.now(TZ).strftime('%H:%M UTC')}")
+    embed.set_footer(text=f"Updated: {datetime.now(TZ).strftime('%H:%M EST')}")
 
     # Send/Edit Message
     channel = bot_instance.get_channel(LEADERBOARD_CHANNEL)
@@ -587,6 +591,7 @@ async def check_for_missed_reminders(current_time: datetime):
     
     # Iterate through the 4 stages
     for stage, schedule_time in REMINDER_SCHEDULE.items():
+        # Combine current date with the schedule time, ensuring timezone is respected
         scheduled_dt = datetime.combine(current_time.date(), schedule_time, tzinfo=TZ)
         
         # If scheduled time passed less than 30 mins ago
